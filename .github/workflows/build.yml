@@ -68,6 +68,15 @@ jobs:
             cargo build --release --locked -p vta-service --bin vta \
               --no-default-features --features "$FEATURES"
 
+      - name: Build pnm (operator CLI, tree a only)
+        if: matrix.tree == 'a'
+        run: |
+          docker run --rm -v "$PWD/src":/src -w /src \
+            -e CARGO_TARGET_DIR=/src/target vta-builder:bookworm \
+            cargo build --release --locked -p pnm-cli --bin pnm
+          cp src/target/release/pnm out/pnm 2>/dev/null || { mkdir -p out; cp src/target/release/pnm out/pnm; }
+          sha256sum out/pnm
+
       - name: Hash the artifact
         run: |
           cp src/target/release/vta out/vta
