@@ -1,0 +1,117 @@
+name: vta aarch64 build
+
+# GitHub-hosted arm64 runners (4 vCPU / 16 GB) are free and unlimited on public
+# repositories. Two independent builds run on two different runners; the compare
+# job then asks whether they produced the same bytes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+env:
+  TAG: vta-service-v0.34.1
+  COMMIT: 6767b59700dcc34fbd714fa97f87733b85d637bd
+  # didcomm must be compiled in: without it vta-service fails with 18 errors at
+  # this tag. The transport is still off at runtime. cli-synthesis is required
+  # by the vta binary itself (required-features).
+  FEATURES: setup,rest,didcomm,config-seed,cli-synthesis
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        tree: [a, b]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Clone upstream at the pinned tag
+        run: |
+          git clone --quiet --depth 1 --branch "$TAG" \
+            https://github.com/OpenVTC/verifiable-trust-infrastructure src
+          got=$(git -C src rev-parse HEAD)
+          [ "$got" = "$COMMIT" ] || { echo "commit mismatch: $got != $COMMIT"; exit 1; }
+
+      - name: Build the builder image
+        run: docker build -q -t vta-builder:bookworm docker/vta-builder
+
+      - name: Write the source lock
+        run: |
+          mkdir -p out
+          docker run --rm vta-builder:bookworm sh -c \
+            'rustc --version; cargo --version; dpkg-query -W libdbus-1-dev libssl-dev pkg-config libc6' > out/image.versions
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess, time
+          sh = lambda *c: subprocess.run(c, capture_output=True, text=True).stdout.strip()
+          json.dump({
+            "repo": "OpenVTC/verifiable-trust-infrastructure",
+            "tag": os.environ["TAG"], "commit": os.environ["COMMIT"],
+            "cargo_lock_sha256": hashlib.sha256(open("src/Cargo.lock","rb").read()).hexdigest(),
+            "features": os.environ["FEATURES"].split(","), "no_default_features": True,
+            "package": "vta-service", "bin": "vta", "target": "aarch64-unknown-linux-gnu",
+            "builder_base": "rust@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e",
+            "builder_versions": open("out/image.versions").read().strip().split("\n"),
+            "runner": sh("uname","-srm"), "locked": True,
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+          }, open("out/lock.json","w"), indent=1)
+          PY
+          cat out/lock.json
+
+      - name: Build vta
+        run: |
+          epoch=$(git -C src log -1 --format=%ct)
+          docker run --rm -v "$PWD/src":/src -w /src \
+            -e CARGO_TARGET_DIR=/src/target -e SOURCE_DATE_EPOCH="$epoch" \
+            -e RUSTFLAGS="--remap-path-prefix=/usr/local/cargo=/cargo" \
+            vta-builder:bookworm \
+            cargo build --release --locked -p vta-service --bin vta \
+              --no-default-features --features "$FEATURES"
+
+      - name: Hash the artifact
+        run: |
+          cp src/target/release/vta out/vta
+          sha256sum out/vta | tee out/artifacts.sha256
+          file out/vta | tee -a out/artifacts.sha256
+
+      - name: Supply chain (tree a only)
+        if: matrix.tree == 'a'
+        run: |
+          docker run --rm -v "$PWD/src":/src -w /src vta-builder:bookworm sh -c \
+            'cargo install --quiet --locked cargo-deny cargo-cyclonedx && \
+             cargo deny --locked check 2>&1 | tail -30 && \
+             cd vta-service && cargo cyclonedx -f json --no-default-features -F "'"$FEATURES"'" --target aarch64-unknown-linux-gnu' \
+            | tee out/supply.log
+          cp src/vta-service/vta-service.cdx.json out/sbom.cdx.json || true
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-${{ matrix.tree }}
+          path: out/
+
+  compare:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@v8
+        with: { path: dl }
+      - name: Compare the two builds
+        run: |
+          a=$(cut -d' ' -f1 dl/build-a/artifacts.sha256 | head -1)
+          b=$(cut -d' ' -f1 dl/build-b/artifacts.sha256 | head -1)
+          echo "a=$a"; echo "b=$b"
+          if [ "$a" = "$b" ]; then level=bit-for-bit; differ=0
+          else level=functional-only; differ=$(cmp -l dl/build-a/vta dl/build-b/vta | wc -l); fi
+          python3 - "$level" "$differ" "$a" <<'PY'
+          import json, os, sys
+          level, differ, sha = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+          m = json.load(open("dl/build-a/lock.json"))
+          m.update(reproducibility=level, differing_bytes=differ, sha256=sha,
+                   size_bytes=os.path.getsize("dl/build-a/vta"),
+                   runner_b=json.load(open("dl/build-b/lock.json"))["runner"])
+          json.dump(m, open("build-manifest.json","w"), indent=1)
+          print(json.dumps(m, indent=1))
+          PY
+          echo "### reproducibility: $level" >> $GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v7
+        with: { name: build-manifest, path: build-manifest.json }
