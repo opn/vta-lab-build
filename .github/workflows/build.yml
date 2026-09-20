@@ -106,6 +106,49 @@ jobs:
           name: build-${{ matrix.tree }}
           path: out/
 
+  upstream-tests:
+    # Namespace 1 of three: upstream's OWN tests, run unchanged. A pass here is
+    # not a TOWEL pass — those live on the lab's conformance matrix.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Clone upstream at the pinned tag
+        run: |
+          git clone --quiet --depth 1 --branch "$TAG" \
+            https://github.com/OpenVTC/verifiable-trust-infrastructure src
+          [ "$(git -C src rev-parse HEAD)" = "$COMMIT" ] || exit 1
+      - name: Build the builder image
+        run: docker build -q -t vta-builder:bookworm docker/vta-builder
+      - name: cargo test --workspace
+        id: tests
+        continue-on-error: true
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD/src":/src -w /src \
+            -e CARGO_TARGET_DIR=/src/target-test -e CARGO_BUILD_JOBS=4 \
+            vta-builder:bookworm \
+            cargo test --workspace --locked --no-fail-fast 2>&1 | tee out/upstream-tests.log
+          echo "exit=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
+      - name: Summarise
+        run: |
+          grep -E "^test result:" out/upstream-tests.log | tee out/summary.txt || true
+          python3 - <<'PY'
+          import json, re
+          log = open("out/upstream-tests.log", errors="replace").read()
+          rows = re.findall(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored", log)
+          total = {k: sum(int(r[i]) for r in rows) for i, k in ((1,"passed"),(2,"failed"),(3,"ignored"))}
+          total["suites"] = len(rows)
+          total["failed_names"] = re.findall(r"^failures:\n\n((?:    .*\n)+)", log, re.M)[:1]
+          json.dump(total, open("out/upstream-tests.json","w"), indent=1)
+          print(json.dumps({k: v for k, v in total.items() if k != "failed_names"}, indent=1))
+          PY
+          echo "### upstream tests: $(cat out/summary.txt | wc -l) suites" >> $GITHUB_STEP_SUMMARY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: upstream-tests
+          path: out/
+
   compare:
     needs: build
     runs-on: ubuntu-24.04-arm
