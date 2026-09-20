@@ -71,11 +71,19 @@ jobs:
       - name: Build pnm (operator CLI, tree a only)
         if: matrix.tree == 'a'
         run: |
+          # Default build: OS keyring session store, for an operator with a desktop.
           docker run --rm -v "$PWD/src":/src -w /src \
             -e CARGO_TARGET_DIR=/src/target vta-builder:bookworm \
             cargo build --release --locked -p pnm-cli --bin pnm
-          cp src/target/release/pnm out/pnm 2>/dev/null || { mkdir -p out; cp src/target/release/pnm out/pnm; }
-          sha256sum out/pnm
+          cp src/target/release/pnm out/pnm
+          # Headless build: a Pi has no Secret Service, and the session backend is
+          # chosen at COMPILE time. Sessions land in ~/.config/pnm/sessions.json.
+          docker run --rm -v "$PWD/src":/src -w /src \
+            -e CARGO_TARGET_DIR=/src/target-headless vta-builder:bookworm \
+            cargo build --release --locked -p pnm-cli --bin pnm \
+              --no-default-features --features config-session
+          cp src/target-headless/release/pnm out/pnm-headless
+          sha256sum out/pnm out/pnm-headless
 
       - name: Hash the artifact
         run: |
