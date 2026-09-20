@@ -127,6 +127,7 @@ jobs:
           mkdir -p out
           docker run --rm -v "$PWD/src":/src -w /src \
             -e CARGO_TARGET_DIR=/src/target-test -e CARGO_BUILD_JOBS=4 \
+            -e VTC_SKIP_ADMIN_UI_BUILD=1 \
             vta-builder:bookworm \
             cargo test --workspace --locked --no-fail-fast 2>&1 | tee out/upstream-tests.log
           echo "exit=${PIPESTATUS[0]}" >> $GITHUB_OUTPUT
