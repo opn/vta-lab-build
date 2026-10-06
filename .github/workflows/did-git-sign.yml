@@ -12,7 +12,7 @@ on:
 env:
   REPO: OpenVTC/verifiable-git-infrastructure
   TAG: v0.18.1
-  COMMIT: 3d7c95dc6a4ab20b8732909663eb1880d6356648
+  COMMIT: 8dafb8844b2bb2b62821d18107517b167eb8f76f
   PACKAGE: did-git-sign
   BIN: did-git-sign
 
