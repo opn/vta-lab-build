@@ -1,0 +1,102 @@
+name: did-git-sign aarch64 build
+
+# Builds did-git-sign (Verifiable Git Infrastructure) for the Pi 5 in the same
+# pinned bookworm container as the Towel, on two independent arm64 runners, and
+# compares the bytes. Plan: Towel Holds the Key (trust.private.fish).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/did-git-sign.yml']
+
+env:
+  REPO: OpenVTC/verifiable-git-infrastructure
+  TAG: v0.18.1
+  COMMIT: 3d7c95dc6a4ab20b8732909663eb1880d6356648
+  PACKAGE: did-git-sign
+  BIN: did-git-sign
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        tree: [a, b]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Clone upstream at the pinned tag
+        run: |
+          git clone --quiet --depth 1 --branch "$TAG" "https://github.com/$REPO" src
+          got=$(git -C src rev-parse HEAD)
+          [ "$got" = "$COMMIT" ] || { echo "commit mismatch: $got != $COMMIT"; exit 1; }
+
+      - name: Build the builder image
+        run: docker build -q -t vta-builder:bookworm docker/vta-builder
+
+      - name: Write the source lock
+        run: |
+          mkdir -p out
+          docker run --rm vta-builder:bookworm sh -c \
+            'rustc --version; cargo --version; dpkg-query -W libdbus-1-dev libssl-dev pkg-config libc6' > out/image.versions
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess, time
+          sh = lambda *c: subprocess.run(c, capture_output=True, text=True).stdout.strip()
+          json.dump({
+            "repo": os.environ["REPO"], "tag": os.environ["TAG"], "commit": os.environ["COMMIT"],
+            "cargo_lock_sha256": hashlib.sha256(open("src/Cargo.lock","rb").read()).hexdigest(),
+            "package": os.environ["PACKAGE"], "bin": os.environ["BIN"],
+            "features": "default (tsp)", "target": "aarch64-unknown-linux-gnu",
+            "builder_versions": open("out/image.versions").read().strip().split("\n"),
+            "runner": sh("uname","-srm"), "locked": True,
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+          }, open("out/lock.json","w"), indent=1)
+          PY
+          cat out/lock.json
+
+      - name: Build did-git-sign
+        run: |
+          epoch=$(git -C src log -1 --format=%ct)
+          docker run --rm -v "$PWD/src":/src -w /src \
+            -e CARGO_TARGET_DIR=/src/target -e SOURCE_DATE_EPOCH="$epoch" \
+            -e RUSTFLAGS="--remap-path-prefix=/usr/local/cargo=/cargo" \
+            vta-builder:bookworm \
+            cargo build --release --locked -p "$PACKAGE" --bin "$BIN"
+
+      - name: Hash the artifact
+        run: |
+          cp "src/target/release/$BIN" "out/$BIN"
+          sha256sum "out/$BIN" | tee out/sha256
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: did-git-sign-${{ matrix.tree }}
+          path: out
+          if-no-files-found: error
+
+  compare:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: did-git-sign-*
+      - name: Same bytes from two runners?
+        run: |
+          a=$(cut -d' ' -f1 did-git-sign-a/sha256); b=$(cut -d' ' -f1 did-git-sign-b/sha256)
+          echo "a=$a"; echo "b=$b"
+          cmp did-git-sign-a/did-git-sign did-git-sign-b/did-git-sign && echo "REPRODUCIBLE" || { echo "DIFFERENT"; exit 1; }
+          mkdir -p manifest
+          python3 - <<'PY'
+          import json
+          lock = json.load(open("did-git-sign-a/lock.json"))
+          lock["sha256"] = open("did-git-sign-a/sha256").read().split()[0]
+          lock["reproducible"] = True
+          json.dump(lock, open("manifest/build-manifest.json", "w"), indent=1)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: did-git-sign-manifest
+          path: manifest
